@@ -5,7 +5,7 @@ import { httpGet, buildQueryString } from "../utils/http-util.js";
 import { convertToAsciiSum } from "../utils/codec-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
-import { printFirst200Chars, titleMatches } from "../utils/common-util.js";
+import { printFirst200Chars, titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
 
 // =====================
@@ -34,17 +34,39 @@ export default class SohuSource extends BaseSource {
       return null;
     }
 
+    // 过滤仅预告片结果 通过 is_trailer 字段判断 (1 为预告片)
+    if (item.is_trailer === 1) {
+      return null;
+    }
+
+    // 过滤仅预告片结果 通过角标文字判断 (corner_mark.text 为 "预告")
+    if (item.corner_mark && item.corner_mark.text === '预告') {
+      return null;
+    }
+
     // 清理标题中的高亮标记
     let title = item.album_name.replace('<<<', '').replace('>>>', '');
 
     // 从meta中提取类型信息
     // meta格式: ["20集全", "电视剧 | 内地 | 2018年", "主演：..."]
     let categoryName = null;
-    if (item.meta && item.meta.length >= 2) {
-      const metaText = item.meta[0].txt; // "电视剧 | 内地 | 2018年"
-      const parts = metaText.split('|');
-      if (parts.length > 0) {
-        categoryName = parts[0].trim(); // "电视剧"
+    if (item.meta && Array.isArray(item.meta)) {
+      // 遍历 meta 数组，寻找包含 "|" 的条目 (例如: "电视剧 | 美国 | 2018年")
+      for (const metaData of item.meta) {
+        if (metaData.txt && metaData.txt.includes('|')) {
+          const parts = metaData.txt.split('|');
+          if (parts.length > 0) {
+            const firstPart = parts[0].trim();
+            // 额外处理：如果第一部分是 "别名：XXX"，则取第二部分
+            // (例如 "别名：铁面无私包公 | 电影 | ...")
+            if (firstPart.includes('别名') && parts.length > 1) {
+               categoryName = parts[1].trim();
+            } else {
+               categoryName = firstPart;
+            }
+            break; // 找到后立即停止
+          }
+        }
       }
     }
 
@@ -125,51 +147,52 @@ export default class SohuSource extends BaseSource {
     }
   }
 
+  async getPlaylistData(id) {
+    const params = {
+      'playlistid': id,
+      'api_key': "f351515304020cad28c92f70f002261c"
+    };
+
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer': 'https://tv.sohu.com/'
+    };
+
+    const playlistUrl = `https://pl.hd.sohu.com/videolist?${buildQueryString(params)}`;
+    const response = await httpGet(playlistUrl, { headers, timeout: 15000 });
+
+    if (!response || !response.data) {
+      return null;
+    }
+
+    let data = response.data;
+    if (typeof data === "string" && data.startsWith('jsonp')) {
+      const start = data.indexOf('(') + 1;
+      const end = data.lastIndexOf(')');
+      if (start > 0 && end > start) {
+        data = JSON.parse(data.substring(start, end));
+      } else {
+        log("error", "搜狐视频: 无法解析JSONP响应");
+        return null;
+      }
+    } else if (typeof data === "string") {
+      data = JSON.parse(data);
+    }
+
+    return data;
+  }
+
   async getEpisodes(id) {
     try {
       log("info", `[Sohu] 获取分集列表: media_id=${id}`);
 
-      let videosData = null;
-
-      const params = {
-        'playlistid': id,
-        'api_key': "f351515304020cad28c92f70f002261c"
-      };
-
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://tv.sohu.com/'
-      };
-
-      const playlistUrl = `https://pl.hd.sohu.com/videolist?${buildQueryString(params)}`;
-
-      const response = await httpGet(playlistUrl, { headers, timeout: 15000 });
-
-      if (!response || !response.data) {
+      const data = await this.getPlaylistData(id);
+      if (!data) {
         log("info", "[Sohu] 分集响应为空");
         return [];
       }
 
-      let data = response.data;
-
-      // 解析JSONP响应
-      if (typeof data === "string" && data.startsWith('jsonp')) {
-        // 提取括号内的JSON
-        const start = data.indexOf('(') + 1;
-        const end = data.lastIndexOf(')');
-        if (start > 0 && end > start) {
-          const jsonStr = data.substring(start, end);
-          data = JSON.parse(jsonStr);
-        } else {
-          log("error", "搜狐视频: 无法解析JSONP响应");
-          return [];
-        }
-      } else if (typeof data === "string") {
-        data = JSON.parse(data);
-      }
-
-      // 提取视频列表
-      videosData = data.videos || [];
+      const videosData = data.videos || [];
 
       if (!videosData || videosData.length === 0) {
         log("warning", `搜狐视频: 未找到分集列表 (media_id=${id})`);
@@ -217,7 +240,15 @@ export default class SohuSource extends BaseSource {
     }
   }
 
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
+  /**
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map|null} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
+   */
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
@@ -226,10 +257,28 @@ export default class SohuSource extends BaseSource {
       return [];
     }
 
+    // 基础标题与季度匹配过滤
+    let filteredAnimes = sourceAnimes.filter(s => titleMatches(s.title, queryTitle, querySeason));
+
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查结果中是否已包含匹配项
+    if (resolvedQuerySeason !== null) {
+      const seasonFiltered = filteredAnimes.filter(anime => {
+        const s = extractSeasonNumberFromAnimeTitle(anime.title).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (seasonFiltered.length > 0) {
+        filteredAnimes = seasonFiltered;
+        log("info", `[Sohu] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
     // 使用 map 和 async 时需要返回 Promise 数组，并等待所有 Promise 完成
-    const processSohuAnimes = await Promise.all(sourceAnimes
-      .filter(s => titleMatches(s.title, queryTitle))
-      .map(async (anime) => {
+    const processSohuAnimes = await Promise.all(filteredAnimes.map(async (anime) => {
         try {
           const eps = await this.getEpisodes(anime.mediaId);
           let links = [];
@@ -265,7 +314,7 @@ export default class SohuSource extends BaseSource {
 
             tmpAnimes.push(transformedAnime);
 
-            addAnime({...transformedAnime, links: links});
+            addAnime({...transformedAnime, links: links}, detailStore);
 
             if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
           }
@@ -278,6 +327,23 @@ export default class SohuSource extends BaseSource {
     this.sortAndPushAnimesByYear(tmpAnimes, curAnimes);
 
     return processSohuAnimes;
+  }
+
+  async getEpisodeDuration(aid, vid) {
+    if (!aid) return 0;
+
+    try {
+      const data = await this.getPlaylistData(aid);
+      const videos = Array.isArray(data?.videos) ? data.videos : [];
+      if (!videos.length) return 0;
+
+      const matchedVideo = videos.find(video => String(video?.vid || '') === String(vid || '')) || (videos.length === 1 ? videos[0] : null);
+      const duration = Number(matchedVideo?.playLength || 0);
+      return Number.isFinite(duration) && duration > 0 ? duration : 0;
+    } catch (error) {
+      log("warn", `[Sohu] 获取真实时长失败: ${error.message}`);
+      return 0;
+    }
   }
 
   // 提取vid和aid的公共函数
@@ -408,13 +474,13 @@ export default class SohuSource extends BaseSource {
     // 解析 episode_id
     const { vid, aid } = await this.extractVidAndAid(id);
 
-    // 搜狐视频的弹幕分段逻辑，使用固定的最大时间
-    const maxTime = 10800;
+    const duration = await this.getEpisodeDuration(aid, vid);
+    const maxTime = duration > 0 ? Math.ceil(duration) : 10800;
     const segmentDuration = 300; // 300秒一段
     const segments = [];
 
     for (let start = 0; start < maxTime; start += segmentDuration) {
-      const end = start + segmentDuration;
+      const end = Math.min(start + segmentDuration, maxTime);
       segments.push({
         "type": "sohu",
         "segment_start": start,
@@ -425,6 +491,7 @@ export default class SohuSource extends BaseSource {
 
     return new SegmentListResponse({
       "type": "sohu",
+      "duration": duration > 0 ? duration : 0,
       "segmentList": segments
     });
   }
@@ -490,7 +557,8 @@ export default class SohuSource extends BaseSource {
           cid: String(danmuId),
           p: pString,
           m: comment.c || '',
-          t: parseFloat(vtime)
+          t: parseFloat(vtime),
+          like: comment.fcount
         };
       } catch (error) {
         log("error", `格式化弹幕失败: ${error.message}, 弹幕数据:`, comment);
